@@ -1,0 +1,4 @@
+# The v-Drive stores CRLF; this repo deliberately stores LF and lets
+# bin/kinesis-edge convert at the boundary. Pin it so no core.autocrlf
+# setting on any machine can quietly reintroduce CRs into the source.
+*.txt text eol=lf

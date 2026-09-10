@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# kinesis-edge — mirror the Freestyle Edge RGB's v-Drive config into git.
+#
+# The keyboard (KB975, firmware 1.0.121) stores all nine profiles as plain .txt
+# on a 4MB FAT volume, the "v-Drive", which is only present while the onboard
+# SmartSet+F8 shortcut has toggled it on. This keeps device/ in this repo
+# as the source of truth so the keymap has a change history and survives a
+# factory reset, which keyboard-flash-only config does not.
+#
+# Line endings are load-bearing. The firmware writes CRLF and its parser was
+# built against it, so the repo stores LF (normal for editing and diffing) and
+# this script converts on both crossings. Never copy files across by hand.
+#
+#   kinesis-edge status   mount state, firmware, and what differs
+#   kinesis-edge pull     device -> repo   (adopt what is on the keyboard)
+#   kinesis-edge push     repo -> device   (write, flush, unmount)
+#
+# push writes only layouts/, lighting/ and settings/. firmware/version.txt is
+# device-generated and pull-only: it changes when you flash, never before.
+
+set -uo pipefail
+
+LABEL="FS EDGE RGB"
+REPO="$(realpath "$(dirname "$(realpath "$0")")/../device")"
+PUSH_DIRS=(layouts lighting settings)
+PULL_EXTRA=(firmware/version.txt)
+
+die() { echo "kinesis-edge: $*" >&2; exit 1; }
+
+# findmnt -n (not -r) returns the literal path; raw mode escapes the spaces
+# in "FS EDGE RGB" as \x20, which no consumer here would unescape correctly.
+mountpoint_of() { findmnt -n -o TARGET -S LABEL="$LABEL" 2>/dev/null; }
+# blkid finds the volume even while unmounted, and unlike lsblk/by-label it
+# returns the path unescaped. Works as a normal user off the udev-maintained cache.
+device_of()     { blkid -L "$LABEL" 2>/dev/null; }
+
+# Sets MP. Deliberately NOT echo-into-$( ) — die's exit would only kill the
+# subshell there, and the caller would sail on with an empty mount path.
+# There are three states, not two, and conflating them gives dangerous advice:
+#   closed              29ea:0102, no block device      -> SmartSet+F8
+#   connected+unmounted 29ea:0103, /dev/sdX, no mount   -> udisksctl mount
+#   mounted             files readable                  -> ready
+# Telling someone in the middle state to press SmartSet+F8 sends them backwards.
+MP=""
+require_mount() {
+  MP="$(mountpoint_of)"
+  if [[ -z $MP ]]; then
+    local dev; dev="$(device_of)"
+    [[ -n $dev ]] || die "v-Drive is closed. Press SmartSet+F8 on the keyboard (the gear key), then retry."
+    echo "v-Drive present but unmounted; mounting $dev" >&2
+    udisksctl mount -b "$dev" >/dev/null 2>&1 || die "could not mount $dev"
+    MP="$(mountpoint_of)"
+    [[ -n $MP ]] || die "mounted $dev but cannot find its mount point"
+  fi
+  # Refuse to write to something that merely shares the label.
+  local d; for d in "${PUSH_DIRS[@]}"; do
+    [[ -d "$MP/$d" ]] || die "$MP/$d missing — that volume does not look like an Edge v-Drive."
+  done
+}
+
+# LF -> CRLF. awk (not sed) because it terminates the final line even when the
+# source lacks a trailing newline, and emits nothing at all for an empty file,
+# which is what an unprogrammed layout must stay.
+to_crlf() { awk '{ sub(/\r*$/, ""); printf "%s\r\n", $0 }' "$1"; }
+to_lf()   { awk '{ sub(/\r*$/, ""); print }' "$1"; }
+
+repo_dirty() {
+  git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || return 1
+  [[ -n "$(git -C "$REPO" status --porcelain -- "$REPO" 2>/dev/null)" ]]
+}
+
+cmd_status() {
+  local mp dev; mp="$(mountpoint_of)"; dev="$(device_of)"
+  if [[ -z $mp ]]; then
+    if [[ -n $dev ]]; then
+      echo "v-Drive:  connected but unmounted at $dev"
+      echo "          (pull/push mount it automatically; SmartSet+F8 closes the drive entirely)"
+    else
+      echo "v-Drive:  closed — press SmartSet+F8 on the keyboard to connect it"
+    fi
+    echo "repo:     $REPO"
+    return 0
+  fi
+  echo "v-Drive:  $mp  ($dev)"
+  echo "repo:     $REPO"
+  if [[ -r "$mp/firmware/version.txt" ]]; then
+    echo "firmware:"; to_lf "$mp/firmware/version.txt" | sed 's/^/  /'
+  fi
+  echo "differences (repo vs device, line endings normalised):"
+  local found=0 d f rel
+  for d in "${PUSH_DIRS[@]}"; do
+    for f in "$mp/$d"/*.txt; do
+      [[ -e $f ]] || continue
+      rel="$d/$(basename "$f")"
+      if [[ ! -e "$REPO/$rel" ]]; then
+        echo "  only on device: $rel"; found=1; continue
+      fi
+      if ! diff -q <(to_lf "$REPO/$rel") <(to_lf "$f") >/dev/null; then
+        echo "  differs: $rel"; found=1
+      fi
+    done
+  done
+  (( found )) || echo "  none — repo and device agree"
+}
+
+cmd_pull() {
+  require_mount; local mp="$MP"
+  if repo_dirty && [[ ${1:-} != "-f" ]]; then
+    die "$REPO has uncommitted changes; pull would overwrite them. Commit first, or pass -f."
+  fi
+  local d f rel n=0
+  for d in "${PUSH_DIRS[@]}"; do
+    mkdir -p "$REPO/$d"
+    for f in "$mp/$d"/*.txt; do
+      [[ -e $f ]] || continue
+      rel="$d/$(basename "$f")"
+      to_lf "$f" > "$REPO/$rel" || die "failed writing $REPO/$rel"
+      n=$((n+1))
+    done
+  done
+  for rel in "${PULL_EXTRA[@]}"; do
+    [[ -r "$mp/$rel" ]] || continue
+    mkdir -p "$REPO/$(dirname "$rel")"
+    to_lf "$mp/$rel" > "$REPO/$rel" && n=$((n+1))
+  done
+  echo "pulled $n files into $REPO"
+}
+
+cmd_push() {
+  require_mount; local mp="$MP"
+  local d f rel n=0
+  for d in "${PUSH_DIRS[@]}"; do
+    [[ -d "$REPO/$d" ]] || continue
+    for f in "$REPO/$d"/*.txt; do
+      [[ -e $f ]] || continue
+      rel="$d/$(basename "$f")"
+      to_crlf "$f" > "$mp/$rel" || die "failed writing $mp/$rel"
+      n=$((n+1))
+    done
+  done
+  sync -f "$mp" 2>/dev/null || sync
+  echo "wrote $n files to the v-Drive"
+  local dev; dev="$(device_of)"
+  if udisksctl unmount -b "$dev" >/dev/null 2>&1; then
+    echo "unmounted $dev — safe to press SmartSet+F8 to close the v-Drive"
+  else
+    echo "NOTE: could not unmount $dev automatically; eject it in the file manager" >&2
+    echo "      BEFORE pressing SmartSet+F8, or you will corrupt the FAT volume." >&2
+  fi
+  echo "Changes take effect when the v-Drive closes, or immediately via SmartSet+Layout (Refresh)."
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  pull)   cmd_pull "${2:-}" ;;
+  push)   cmd_push ;;
+  *)      die "usage: kinesis-edge [status|pull [-f]|push]" ;;
+esac
